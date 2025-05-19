@@ -8,6 +8,12 @@ import ua.nure.holovashenko.flameguard_api.entity.SystemSettings;
 import ua.nure.holovashenko.flameguard_api.repository.SystemSettingsRepository;
 
 import javax.sql.DataSource;
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.sql.Statement;
@@ -44,49 +50,80 @@ public class SystemSettingsService {
     }
 
     public void createDatabaseBackup(String backupFilePath) {
-        String backupQuery = String.format("BACKUP DATABASE FlameGuard TO DISK = '%s'", backupFilePath);
+        backupFilePath = ensureSqlExtension(backupFilePath);
+        Path backupPath = prepareBackupFile(backupFilePath);
 
-        executeDatabaseOperation(backupQuery, "Backup created successfully", "Error creating database backup");
+        String command = String.format("mysqldump -u%s -p%s %s > '%s'",
+                "root", "12345678", "FlameGuard", backupPath.toAbsolutePath());
+
+        executeShellCommand(command, "Backup created successfully at %s", "Failed to create database backup");
     }
 
     public void restoreDatabase(String backupFilePath) {
-        String switchToMasterQuery = "USE master;";
-        String setSingleUserQuery = "ALTER DATABASE FlameGuard SET SINGLE_USER WITH ROLLBACK IMMEDIATE;";
-        String restoreQuery = String.format("RESTORE DATABASE FlameGuard FROM DISK = '%s' WITH REPLACE", backupFilePath);
-        String setMultiUserQuery = "ALTER DATABASE FlameGuard SET MULTI_USER;";
+        if (!backupFilePath.endsWith(".sql")) {
+            throw new IllegalArgumentException("Backup file must be a .sql file");
+        }
 
-        try (Connection connection = dataSource.getConnection();
-             Statement statement = connection.createStatement()) {
+        String command = String.format("mysql -u%s -p%s %s < '%s'",
+                "root", "12345678", "FlameGuard", backupFilePath);
 
-            statement.execute(switchToMasterQuery);
-            logger.info("Switched to master database.");
+        executeShellCommand(command, "Database restored successfully from %s", "Failed to restore database");
+    }
 
-            executeStatement(statement, setSingleUserQuery, "Database set to SINGLE_USER mode.");
-            executeStatement(statement, restoreQuery, "Database restored successfully.");
-            executeStatement(statement, setMultiUserQuery, "Database set to MULTI_USER mode.");
+    private String ensureSqlExtension(String path) {
+        return path.endsWith(".sql") ? path : path + ".sql";
+    }
 
-        } catch (SQLException e) {
-            logger.error("Error restoring database: {}", e.getMessage(), e);
-            throw new RuntimeException("Error restoring database", e);
+    private Path prepareBackupFile(String backupFilePath) {
+        Path backupPath = Paths.get(backupFilePath);
+        try {
+            if (backupPath.getParent() != null) {
+                Files.createDirectories(backupPath.getParent());
+            }
+
+            if (!Files.exists(backupPath)) {
+                Files.createFile(backupPath);
+            }
+
+            if (!Files.isWritable(backupPath)) {
+                throw new IOException("No write permission to the backup file path.");
+            }
+
+            return backupPath;
+
+        } catch (IOException e) {
+            logger.error("Failed to prepare backup file: {}", e.getMessage(), e);
+            throw new RuntimeException("Could not prepare backup file", e);
         }
     }
 
-    private void executeDatabaseOperation(String query, String successMessage, String errorMessage) {
-        try (Connection connection = dataSource.getConnection();
-             Statement statement = connection.createStatement()) {
+    private void executeShellCommand(String command, String successMessageFormat, String errorMessage) {
+        String[] shellCommand = {"bash", "-c", command};
 
-            statement.execute(query);
-            logger.info(successMessage);
+        try {
+            ProcessBuilder pb = new ProcessBuilder(shellCommand);
+            pb.redirectErrorStream(true);
+            Process process = pb.start();
 
-        } catch (SQLException e) {
-            logger.error("{}: {}", errorMessage, e.getMessage(), e);
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    logger.info("[shell] {}", line);
+                }
+            }
+
+            int exitCode = process.waitFor();
+            if (exitCode == 0) {
+                logger.info(successMessageFormat, command);
+            } else {
+                logger.error("{} with exit code {}", errorMessage, exitCode);
+                throw new RuntimeException(errorMessage + ". Exit code: " + exitCode);
+            }
+
+        } catch (IOException | InterruptedException e) {
+            logger.error("Error executing command '{}': {}", command, e.getMessage(), e);
             throw new RuntimeException(errorMessage, e);
         }
-    }
-
-    private void executeStatement(Statement statement, String query, String successMessage) throws SQLException {
-        statement.execute(query);
-        logger.info(successMessage);
     }
 
     public SystemSettings saveOrUpdateSetting(String settingKey, String settingValue) {
